@@ -1,0 +1,12 @@
+[package]
+name = "vscode-privacy-tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.36", features = ["bundled"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4"] }
+sha2 = "0.10"
+dirs = "6.0"
+sysinfo = "0.35"
