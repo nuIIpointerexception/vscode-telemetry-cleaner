@@ -8,6 +8,10 @@ on:
   release:
     types: [ published ]
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   build:
     name: Build
@@ -75,8 +79,7 @@ jobs:
     
     - name: Upload to release
       if: github.event_name == 'release'
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: ${{ matrix.asset_name }}
