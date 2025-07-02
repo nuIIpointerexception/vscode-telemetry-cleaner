@@ -10,14 +10,25 @@ pub fn terminate_vscode_processes(tx: &mpsc::UnboundedSender<ZenEvent>) {
         let name = process.name().to_string_lossy();
         let exe = process.exe().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
 
+        let name_lower = name.to_lowercase();
+        let cmd_lower = cmd.to_lowercase();
+        let exe_lower = exe.to_lowercase();
+
         let is_vscode = VSCODE_PROCESSES.iter().any(|&vs| name.eq_ignore_ascii_case(vs))
-            || cmd.contains("vscode")
-            || exe.contains("microsoft vs code")
-            || exe.contains("cursor")
-            || exe.contains("code-insiders")
-            || exe.contains("windsurf")
-            || exe.contains("trae")
-            || (exe.contains("code") && exe.contains("electron"));
+            || cmd_lower.contains("vscode")
+            || exe_lower.contains("microsoft vs code")
+            || exe_lower.contains("visual studio code")
+            || name_lower.contains("cursor")
+            || name_lower.contains("code-insiders")
+            || name_lower.contains("windsurf")
+            || name_lower.contains("trae")
+            || name_lower.contains("vscodium")
+            || exe_lower.contains("/code")
+            || exe_lower.contains("\\code.exe")
+            || exe_lower.contains("/cursor")
+            || exe_lower.contains("\\cursor.exe")
+            || (exe_lower.contains("code") && exe_lower.contains("electron"))
+            || exe_lower.contains(".app/contents/macos/electron");
 
         if !is_vscode { continue; }
 

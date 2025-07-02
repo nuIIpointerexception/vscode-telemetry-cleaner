@@ -8,40 +8,67 @@ use crate::utils::{Result, CleanerError, ErrorCollector, TELEMETRY_KEYS};
 use tokio::sync::mpsc;
 use crate::zen_garden::ZenEvent;
 
-// Windows file permission handling
-#[cfg(windows)]
-struct FilePermissions {
+pub struct FilePermissions {
     was_readonly: bool,
+    #[cfg(unix)]
+    original_mode: u32,
 }
 
-#[cfg(windows)]
 impl FilePermissions {
-    fn backup_and_make_writable(file_path: &Path) -> Result<Self> {
+    pub fn backup_and_make_writable(file_path: &Path) -> Result<Self> {
         let metadata = fs::metadata(file_path)?;
         let was_readonly = metadata.permissions().readonly();
 
-        if was_readonly {
-            // Remove read-only attribute
-            let _ = Command::new("attrib").args(["-R", &file_path.to_string_lossy()]).status();
+        #[cfg(unix)]
+        let original_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        };
 
-            // Also update permissions
+        if was_readonly {
+            #[cfg(windows)]
+            {
+                if Command::new("attrib").args(["-R", &file_path.to_string_lossy()]).status().is_err() {
+                }
+            }
+
             let mut permissions = metadata.permissions();
             permissions.set_readonly(false);
             fs::set_permissions(file_path, permissions)?;
         }
 
-        Ok(FilePermissions { was_readonly })
+        Ok(FilePermissions {
+            was_readonly,
+            #[cfg(unix)]
+            original_mode,
+        })
     }
 
-    fn restore(&self, file_path: &Path) -> Result<()> {
+    pub fn restore(&self, file_path: &Path) -> Result<()> {
         if self.was_readonly {
-            // Restore read-only attribute
-            let _ = Command::new("attrib").args(["+R", &file_path.to_string_lossy()]).status();
+            #[cfg(windows)]
+            {
+                if Command::new("attrib").args(["+R", &file_path.to_string_lossy()]).status().is_err() {
+                }
+            }
 
-            // Also update permissions
-            let mut permissions = fs::metadata(file_path)?.permissions();
-            permissions.set_readonly(true);
-            fs::set_permissions(file_path, permissions)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let permissions = fs::Permissions::from_mode(self.original_mode);
+                if fs::set_permissions(file_path, permissions).is_err() {
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                if let Ok(metadata) = fs::metadata(file_path) {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_readonly(true);
+                    if fs::set_permissions(file_path, permissions).is_err() {
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -92,8 +119,6 @@ fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -
 
     let _ = tx.send(ZenEvent::LogMessage(format!("harmonizing energy patterns in: {}", storage_path.display())));
 
-    // Handle Windows read-only files
-    #[cfg(windows)]
     let _permissions = match FilePermissions::backup_and_make_writable(&storage_path) {
         Ok(perms) => Some(perms),
         Err(e) => {
@@ -144,8 +169,6 @@ fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -
         return Err(format!("failed to write updated storage.json: {}", e).into());
     }
 
-    // Restore Windows permissions
-    #[cfg(windows)]
     if let Some(permissions) = _permissions {
         if let Err(e) = permissions.restore(&storage_path) {
             let _ = tx.send(ZenEvent::Warning(format!("could not restore permissions for storage.json: {}", e)));
@@ -159,8 +182,6 @@ fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -
 fn update_machine_id_file(file_path: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -> Result<()> {
     let _ = tx.send(ZenEvent::LogMessage(format!("harmonizing essence in: {}", file_path.display())));
 
-    // Handle Windows read-only files
-    #[cfg(windows)]
     let _permissions = if file_path.exists() {
         Some(FilePermissions::backup_and_make_writable(file_path)?)
     } else {
@@ -186,29 +207,29 @@ fn update_machine_id_file(file_path: &Path, tx: &mpsc::UnboundedSender<ZenEvent>
 }
 
 pub fn lock_file_permissions(file_path: &Path) -> Result<()> {
-    // Note: This function is called from update_machine_id_file, so no logging needed here
-
     if !file_path.exists() {
         return Err(format!("File doesn't exist, can't lock: {}", file_path.display()).into());
     }
 
-    if cfg!(windows) {
-        let _ = Command::new("attrib").args(["+R", &file_path.to_string_lossy()]).status();
-    } else {
-        let _ = Command::new("chmod").args(["444", &file_path.to_string_lossy()]).status();
+    let mut permissions = fs::metadata(file_path)?.permissions();
+    permissions.set_readonly(true);
 
-        #[cfg(target_os = "macos")]
-        let _ = Command::new("sudo").args(["chflags", "uchg", &file_path.to_string_lossy()]).status();
+    if let Err(e) = fs::set_permissions(file_path, permissions) {
+        return Err(format!("Failed to set readonly permissions: {}", e).into());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        let mut permissions = fs::metadata(file_path)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(file_path, permissions)?;
+        if Command::new("attrib").args(["+R", &file_path.to_string_lossy()]).status().is_err() {
+        }
     }
 
-    // File successfully locked (no logging needed)
+    #[cfg(unix)]
+    {
+        if Command::new("chmod").args(["444", &file_path.to_string_lossy()]).status().is_err() {
+        }
+    }
+
     Ok(())
 }
 

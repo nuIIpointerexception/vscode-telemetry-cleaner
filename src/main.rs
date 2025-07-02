@@ -8,7 +8,7 @@ async fn main() -> Result<()> {
     let args = CliArgs::parse();
 
     // zen garden is now the default interface
-    let mut garden = ZenGarden::new();
+    let mut garden = ZenGarden::new(&args);
     garden.run(args).await?;
 
     Ok(())

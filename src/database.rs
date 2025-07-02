@@ -1,49 +1,9 @@
 use rusqlite::Connection;
 use std::path::Path;
-use std::fs;
-use std::process::Command;
 use crate::utils::{Result, CleanerError, ErrorCollector, COUNT_QUERY, DELETE_QUERY};
 use tokio::sync::mpsc;
 use crate::zen_garden::ZenEvent;
-
-// Windows file permission handling for database files
-#[cfg(windows)]
-struct DatabasePermissions {
-    was_readonly: bool,
-}
-
-#[cfg(windows)]
-impl DatabasePermissions {
-    fn backup_and_make_writable(file_path: &Path) -> Result<Self> {
-        let metadata = fs::metadata(file_path)?;
-        let was_readonly = metadata.permissions().readonly();
-
-        if was_readonly {
-            // Remove read-only attribute
-            let _ = Command::new("attrib").args(["-R", &file_path.to_string_lossy()]).status();
-
-            // Also update permissions
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            fs::set_permissions(file_path, permissions)?;
-        }
-
-        Ok(DatabasePermissions { was_readonly })
-    }
-
-    fn restore(&self, file_path: &Path) -> Result<()> {
-        if self.was_readonly {
-            // Restore read-only attribute
-            let _ = Command::new("attrib").args(["+R", &file_path.to_string_lossy()]).status();
-
-            // Also update permissions
-            let mut permissions = fs::metadata(file_path)?.permissions();
-            permissions.set_readonly(true);
-            fs::set_permissions(file_path, permissions)?;
-        }
-        Ok(())
-    }
-}
+use crate::storage::FilePermissions;
 
 pub fn clean_vscode_databases(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -> Result<()> {
     let mut error_collector = ErrorCollector::new();
@@ -88,9 +48,7 @@ fn clean_database_file(directory: &Path, filename: &str, tx: &mpsc::UnboundedSen
     let display_name = db_path.file_name().unwrap_or_default().to_string_lossy();
     let _ = tx.send(ZenEvent::LogMessage(format!("examining data spirits in '{}'", display_name)));
 
-    // handle Windows read-only files
-    #[cfg(windows)]
-    let _permissions = match DatabasePermissions::backup_and_make_writable(&db_path) {
+    let _permissions = match FilePermissions::backup_and_make_writable(&db_path) {
         Ok(perms) => Some(perms),
         Err(e) => {
             let _ = tx.send(ZenEvent::Warning(format!("could not modify permissions for '{}': {}", display_name, e)));
@@ -124,8 +82,6 @@ fn clean_database_file(directory: &Path, filename: &str, tx: &mpsc::UnboundedSen
         let _ = tx.send(ZenEvent::LogMessage(format!("no restless spirits found in '{}' - already harmonious", display_name)));
     }
 
-    // restore permissions if we modified them
-    #[cfg(windows)]
     if let Some(permissions) = _permissions {
         if let Err(e) = permissions.restore(&db_path) {
             let _ = tx.send(ZenEvent::Warning(format!("could not restore permissions for '{}': {}", display_name, e)));

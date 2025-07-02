@@ -62,10 +62,25 @@ impl std::fmt::Display for ProcessStone {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ZenState {
     Welcome,
+    CardSelection,
     Scanning,
     Processing,
     Complete,
     Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct CleaningCard {
+    pub name: String,
+    pub description: String,
+    pub is_selected: bool,
+    pub card_type: CardType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CardType {
+    Augment,
+    Cursor,
 }
 
 pub struct ZenGarden {
@@ -85,12 +100,36 @@ pub struct ZenGarden {
     error_collector: crate::utils::ErrorCollector,
     detailed_errors: Vec<crate::utils::CleanerError>,
     warnings: Vec<String>,
+    cards: Vec<CleaningCard>,
+    selected_card: usize,
 }
 
 impl ZenGarden {
-    pub fn new() -> Self {
+    pub fn new(args: &CliArgs) -> Self {
+        let cards = vec![
+            CleaningCard {
+                name: "Augment Extension".to_string(),
+                description: "Clean Augment extension data from VSCode/Cursor".to_string(),
+                is_selected: args.augment,
+                card_type: CardType::Augment,
+            },
+            CleaningCard {
+                name: "Cursor IDE".to_string(),
+                description: "Clean Cursor IDE telemetry and configuration".to_string(),
+                is_selected: args.cursor,
+                card_type: CardType::Cursor,
+            },
+        ];
+
+        // determine initial state based on CLI flags
+        let initial_state = if args.augment || args.cursor {
+            ZenState::Scanning  // skip card selection and start immediately
+        } else {
+            ZenState::CardSelection  // show card selection screen
+        };
+
         Self {
-            state: ZenState::Welcome,
+            state: initial_state,
             events: Vec::new(),
             processes: Vec::new(),
             locations: Vec::new(),
@@ -106,6 +145,8 @@ impl ZenGarden {
             error_collector: crate::utils::ErrorCollector::new(),
             detailed_errors: Vec::new(),
             warnings: Vec::new(),
+            cards,
+            selected_card: 0,
         }
     }
 
@@ -118,12 +159,24 @@ impl ZenGarden {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        // spawn background task for operations
-        let tx_clone = tx.clone();
-        let args_clone = args.clone();
-        tokio::spawn(async move {
-            zen_operations(tx_clone, args_clone).await;
-        });
+        // spawn background task for operations if CLI flags are provided
+        if args.augment || args.cursor {
+            let tx_clone = tx.clone();
+            let args_clone = args.clone();
+
+            // determine selected cards based on CLI flags
+            let mut selected_cards = Vec::new();
+            if args.augment {
+                selected_cards.push(CardType::Augment);
+            }
+            if args.cursor {
+                selected_cards.push(CardType::Cursor);
+            }
+
+            tokio::spawn(async move {
+                zen_operations_with_cards(tx_clone, args_clone, selected_cards).await;
+            });
+        }
 
         let mut last_tick = Instant::now();
         let tick_rate = Duration::from_millis(16); // ~60fps for smooth progress updates
@@ -140,10 +193,26 @@ impl ZenGarden {
                                 self.should_quit = true;
                                 break;
                             }
-                            KeyCode::Enter | KeyCode::Char(' ') => {
+                            KeyCode::Enter => {
                                 if self.state == ZenState::Welcome {
-                                    self.state = ZenState::Scanning;
-                                    let _ = tx.send(ZenEvent::StartScanning);
+                                    self.state = ZenState::CardSelection;
+                                } else if self.state == ZenState::CardSelection {
+                                    // start cleaning with selected cards
+                                    let selected_cards: Vec<_> = self.cards.iter()
+                                        .filter(|c| c.is_selected)
+                                        .map(|c| c.card_type.clone())
+                                        .collect();
+
+                                    if !selected_cards.is_empty() {
+                                        self.state = ZenState::Scanning;
+
+                                        // spawn new background task with selected cards
+                                        let tx_ops = tx.clone();
+                                        let args_ops = args.clone();
+                                        tokio::spawn(async move {
+                                            zen_operations_with_cards(tx_ops, args_ops, selected_cards).await;
+                                        });
+                                    }
                                 } else if self.state == ZenState::Scanning || self.state == ZenState::Processing {
                                     // terminate selected process
                                     if let Some(stone) = self.processes.get_mut(self.selected_stone) {
@@ -157,13 +226,48 @@ impl ZenGarden {
                                     }
                                 }
                             }
+                            KeyCode::Char(' ') => {
+                                if self.state == ZenState::CardSelection {
+                                    // toggle selected card
+                                    if let Some(card) = self.cards.get_mut(self.selected_card) {
+                                        card.is_selected = !card.is_selected;
+                                    }
+                                } else if self.state == ZenState::Scanning || self.state == ZenState::Processing {
+                                    // terminate selected process (same as Enter)
+                                    if let Some(stone) = self.processes.get_mut(self.selected_stone) {
+                                        if !stone.is_terminated {
+                                            let pid = stone.pid;
+                                            let name = stone.name.clone();
+                                            stone.is_terminated = true;
+                                            let _ = tx.send(ZenEvent::ProcessTerminated(name));
+                                            self.terminate_process(pid);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Tab => {
+                                if self.state == ZenState::CardSelection {
+                                    // move to next card
+                                    self.selected_card = (self.selected_card + 1) % self.cards.len();
+                                }
+                            }
                             KeyCode::Up => {
-                                if !self.processes.is_empty() && self.selected_stone > 0 {
+                                if self.state == ZenState::CardSelection {
+                                    // move to previous card
+                                    if self.selected_card > 0 {
+                                        self.selected_card -= 1;
+                                    } else {
+                                        self.selected_card = self.cards.len() - 1;
+                                    }
+                                } else if !self.processes.is_empty() && self.selected_stone > 0 {
                                     self.selected_stone -= 1;
                                 }
                             }
                             KeyCode::Down => {
-                                if !self.processes.is_empty() && self.selected_stone < self.processes.len() - 1 {
+                                if self.state == ZenState::CardSelection {
+                                    // move to next card
+                                    self.selected_card = (self.selected_card + 1) % self.cards.len();
+                                } else if !self.processes.is_empty() && self.selected_stone < self.processes.len() - 1 {
                                     self.selected_stone += 1;
                                 }
                             }
@@ -302,6 +406,7 @@ impl ZenGarden {
 
         match self.state {
             ZenState::Welcome => self.render_welcome(f, inner),
+            ZenState::CardSelection => self.render_card_selection(f, inner),
             ZenState::Scanning | ZenState::Processing => self.render_meditation(f, inner),
             ZenState::Complete => self.render_enlightenment(f, inner),
             ZenState::Error => self.render_turbulence(f, inner),
@@ -361,6 +466,151 @@ impl ZenGarden {
         ]))
         .alignment(Alignment::Center);
         f.render_widget(instructions, chunks[2]);
+    }
+
+    fn render_card_selection(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(3),
+            ])
+            .split(area);
+
+        // title
+        let title = Paragraph::new(Line::from(vec![
+            Span::styled("🧘 ", Style::default().fg(Color::Yellow)),
+            Span::styled("select cleaning modules", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" 🧘", Style::default().fg(Color::Yellow)),
+        ]))
+        .alignment(Alignment::Center);
+        f.render_widget(title, chunks[0]);
+
+        // automatic grid layout for cards
+        let cards_per_row = 3; // can be adjusted for more cards later
+        let card_rows = (self.cards.len() + cards_per_row - 1) / cards_per_row;
+
+        // create row constraints
+        let row_constraints: Vec<Constraint> = (0..card_rows)
+            .map(|_| Constraint::Length(6)) // smaller card height
+            .collect();
+
+        let row_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(row_constraints)
+            .split(chunks[1]);
+
+        // render cards in grid
+        for (card_idx, card) in self.cards.iter().enumerate() {
+            let row = card_idx / cards_per_row;
+            let col = card_idx % cards_per_row;
+
+            if row < row_layout.len() {
+                // create column layout for this row
+                let cols_in_row = std::cmp::min(cards_per_row, self.cards.len() - row * cards_per_row);
+                let col_constraints: Vec<Constraint> = (0..cols_in_row)
+                    .map(|_| Constraint::Percentage(100 / cols_in_row as u16))
+                    .collect();
+
+                let col_layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(col_constraints)
+                    .split(row_layout[row]);
+
+                if col < col_layout.len() {
+                    self.render_cleaning_card(f, col_layout[col], card, card_idx == self.selected_card);
+                }
+            }
+        }
+
+        // instructions
+        let selected_count = self.cards.iter().filter(|c| c.is_selected).count();
+        let instruction_text = if selected_count > 0 {
+            format!("space: toggle • tab: next • enter: run {} module(s) • q: quit", selected_count)
+        } else {
+            "space: toggle • tab: next • enter: run (select at least one) • q: quit".to_string()
+        };
+
+        let instructions = Paragraph::new(Line::from(vec![
+            Span::styled(instruction_text, Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC)),
+        ]))
+        .alignment(Alignment::Center);
+        f.render_widget(instructions, chunks[2]);
+    }
+
+    fn render_cleaning_card(&self, f: &mut Frame, area: Rect, card: &CleaningCard, is_focused: bool) {
+        let border_color = if is_focused {
+            Color::Yellow
+        } else if card.is_selected {
+            Color::Green
+        } else {
+            Color::Gray
+        };
+
+        let border_style = if is_focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+
+        // compact card title
+        let short_name = match card.card_type {
+            CardType::Augment => "Augment",
+            CardType::Cursor => "Cursor",
+        };
+
+        let card_block = Block::default()
+            .title(format!(" {} ", short_name))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color).add_modifier(border_style));
+
+        let card_area = card_block.inner(area);
+        f.render_widget(card_block, area);
+
+        // compact content layout
+        let content_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // icon line
+                Constraint::Length(1), // status line
+                Constraint::Length(1), // focus indicator
+            ])
+            .split(card_area);
+
+        // icon
+        let icon = match card.card_type {
+            CardType::Augment => "🔧",
+            CardType::Cursor => "🖱️",
+        };
+
+        let icon_widget = Paragraph::new(Line::from(Span::styled(
+            icon,
+            Style::default().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center);
+        f.render_widget(icon_widget, content_chunks[0]);
+
+        // status
+        let status_text = if card.is_selected { "✓ selected" } else { "○ not selected" };
+        let status_color = if card.is_selected { Color::Green } else { Color::Gray };
+
+        let status = Paragraph::new(Line::from(Span::styled(
+            status_text,
+            Style::default().fg(status_color),
+        )))
+        .alignment(Alignment::Center);
+        f.render_widget(status, content_chunks[1]);
+
+        // focus indicator
+        if is_focused {
+            let focus_indicator = Paragraph::new(Line::from(Span::styled(
+                "← focused",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+            )))
+            .alignment(Alignment::Center);
+            f.render_widget(focus_indicator, content_chunks[2]);
+        }
     }
 
     fn render_meditation(&self, f: &mut Frame, area: Rect) {
@@ -860,14 +1110,25 @@ fn discover_vscode_processes() -> Vec<ProcessStone> {
         let name = process.name().to_string_lossy().to_string();
         let exe = process.exe().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
 
+        let name_lower = name.to_lowercase();
+        let cmd_lower = cmd.to_lowercase();
+        let exe_lower = exe.to_lowercase();
+
         let is_vscode = VSCODE_PROCESSES.iter().any(|&vs| name.eq_ignore_ascii_case(vs))
-            || cmd.contains("vscode")
-            || exe.contains("microsoft vs code")
-            || exe.contains("cursor")
-            || exe.contains("code-insiders")
-            || exe.contains("windsurf")
-            || exe.contains("trae")
-            || (exe.contains("code") && exe.contains("electron"));
+            || cmd_lower.contains("vscode")
+            || exe_lower.contains("microsoft vs code")
+            || exe_lower.contains("visual studio code")
+            || name_lower.contains("cursor")
+            || name_lower.contains("code-insiders")
+            || name_lower.contains("windsurf")
+            || name_lower.contains("trae")
+            || name_lower.contains("vscodium")
+            || exe_lower.contains("/code")
+            || exe_lower.contains("\\code.exe")
+            || exe_lower.contains("/cursor")
+            || exe_lower.contains("\\cursor.exe")
+            || (exe_lower.contains("code") && exe_lower.contains("electron"))
+            || exe_lower.contains(".app/contents/macos/electron");
 
         if is_vscode {
             stones.push(ProcessStone {
@@ -881,4 +1142,97 @@ fn discover_vscode_processes() -> Vec<ProcessStone> {
     }
 
     stones
+}
+
+async fn zen_operations_with_cards(tx: mpsc::UnboundedSender<ZenEvent>, _args: CliArgs, selected_cards: Vec<CardType>) {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // scanning phase
+    let _ = tx.send(ZenEvent::StartScanning);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut total_operations = 0;
+    let mut _completed_operations = 0;
+
+    // determine what operations we need to do
+    let do_augment = selected_cards.contains(&CardType::Augment);
+    let do_cursor = selected_cards.contains(&CardType::Cursor);
+
+    if do_augment {
+        total_operations += 3; // processes, storage, database
+    }
+    if do_cursor {
+        total_operations += 2; // processes, config
+    }
+
+    let _ = tx.send(ZenEvent::SetTotalOperations(total_operations));
+
+    // process augment cleaning
+    if do_augment {
+        let _ = tx.send(ZenEvent::LogMessage("beginning augment extension purification...".to_string()));
+
+        match crate::augment::clean_augment_extension(&_args).await {
+            Ok(result) => {
+                for process in result.processes_terminated {
+                    let _ = tx.send(ZenEvent::ProcessTerminated(process));
+                }
+                for dir in result.directories_found {
+                    let _ = tx.send(ZenEvent::LocationFound(dir.to_string_lossy().to_string()));
+                }
+                for storage in result.storage_updated {
+                    let _ = tx.send(ZenEvent::StorageUpdated(storage));
+                }
+                for db in result.databases_cleaned {
+                    let _ = tx.send(ZenEvent::DatabaseCleaned(db));
+                }
+
+                if result.errors.has_errors() {
+                    let _ = tx.send(ZenEvent::ErrorSummary(result.errors));
+                }
+
+                _completed_operations += 3;
+            }
+            Err(e) => {
+                let _ = tx.send(ZenEvent::Error(format!("augment cleaning failed: {}", e)));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // process cursor cleaning
+    if do_cursor {
+        let _ = tx.send(ZenEvent::LogMessage("beginning cursor ide purification...".to_string()));
+
+        match crate::cursor::clean_cursor_ide(&_args).await {
+            Ok(result) => {
+                for process in result.processes_terminated {
+                    let _ = tx.send(ZenEvent::ProcessTerminated(process));
+                }
+                for dir in result.directories_removed {
+                    let _ = tx.send(ZenEvent::LocationFound(dir.to_string_lossy().to_string()));
+                }
+
+                if result.config_updated {
+                    let _ = tx.send(ZenEvent::StorageUpdated("cursor configuration".to_string()));
+                }
+
+                if result.errors.has_errors() {
+                    let _ = tx.send(ZenEvent::ErrorSummary(result.errors));
+                }
+
+                _completed_operations += 2;
+            }
+            Err(e) => {
+                let _ = tx.send(ZenEvent::Error(format!("cursor cleaning failed: {}", e)));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // completion
+    let _ = tx.send(ZenEvent::LogMessage("digital purification complete - mind at peace".to_string()));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = tx.send(ZenEvent::OperationComplete);
 }

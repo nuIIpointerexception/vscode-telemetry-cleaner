@@ -5,7 +5,27 @@ use crate::utils::MACHINE_ID;
 
 pub fn find_vscode_storage_directories() -> Vec<PathBuf> {
     let mut seen = HashSet::new();
-    let base_dirs = [dirs::config_dir(), dirs::home_dir(), dirs::data_dir()];
+    let mut base_dirs = vec![dirs::config_dir(), dirs::home_dir(), dirs::data_dir()];
+
+    if let Some(home) = dirs::home_dir() {
+        base_dirs.push(Some(home.join(".vscode")));
+
+        #[cfg(target_os = "linux")]
+        {
+            base_dirs.push(Some(home.join("snap/code/common/.config")));
+            base_dirs.push(Some(home.join(".var/app/com.visualstudio.code/config")));
+            base_dirs.push(Some(home.join(".var/app/com.visualstudio.code-insiders/config")));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(app_support) = dirs::config_dir() {
+                base_dirs.push(Some(app_support.join("Code - Insiders")));
+                base_dirs.push(Some(app_support.join("Cursor")));
+                base_dirs.push(Some(app_support.join("VSCodium")));
+            }
+        }
+    }
 
     let global_patterns = [
         &["User", "globalStorage"] as &[&str],
