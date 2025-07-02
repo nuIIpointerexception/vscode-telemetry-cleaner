@@ -37,8 +37,11 @@ pub enum ZenEvent {
     DatabaseCleaned(String),
     OperationComplete,
     Error(String),
+    DetailedError(crate::utils::CleanerError),
+    Warning(String),
     LogMessage(String),
     SetTotalOperations(usize),
+    ErrorSummary(crate::utils::ErrorCollector),
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +82,9 @@ pub struct ZenGarden {
     water_flow: usize,
     should_quit: bool,
     selected_stone: usize,
+    error_collector: crate::utils::ErrorCollector,
+    detailed_errors: Vec<crate::utils::CleanerError>,
+    warnings: Vec<String>,
 }
 
 impl ZenGarden {
@@ -97,6 +103,9 @@ impl ZenGarden {
             water_flow: 0,
             should_quit: false,
             selected_stone: 0,
+            error_collector: crate::utils::ErrorCollector::new(),
+            detailed_errors: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -227,6 +236,26 @@ impl ZenGarden {
             ZenEvent::Error(error) => {
                 self.state = ZenState::Error;
                 self.events.push(format!("encountered turbulence: {}", error));
+            }
+            ZenEvent::DetailedError(error) => {
+                self.detailed_errors.push(error.clone());
+                self.error_collector.add_error(error.clone());
+                self.events.push(format!("turbulence detected: {}", error));
+                // don't immediately switch to error state - collect errors and continue
+            }
+            ZenEvent::Warning(warning) => {
+                self.warnings.push(warning.clone());
+                self.error_collector.add_warning(warning.clone());
+                self.events.push(format!("gentle warning: {}", warning));
+            }
+            ZenEvent::ErrorSummary(collector) => {
+                self.error_collector = collector.clone();
+                if collector.has_errors() {
+                    self.state = ZenState::Error;
+                    self.current_operation = format!("meditation disrupted - {}", collector.get_summary());
+                } else if collector.has_warnings() {
+                    self.events.push(format!("meditation completed with mindful observations: {}", collector.get_summary()));
+                }
             }
             ZenEvent::LogMessage(message) => {
                 self.events.push(message);
@@ -488,20 +517,38 @@ impl ZenGarden {
     }
 
     fn render_enlightenment(&self, f: &mut Frame, area: Rect) {
+        let has_issues = self.error_collector.has_errors() || self.error_collector.has_warnings();
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(5),
-                Constraint::Length(3),
-            ])
+            .constraints(if has_issues {
+                [
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                ]
+            } else {
+                [
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(0),
+                    Constraint::Length(3),
+                ]
+            })
             .split(area);
 
-        // completion message
+        // completion message with summary
+        let completion_title = if has_issues {
+            format!("🌸 meditation complete - {} 🌸", self.error_collector.get_summary())
+        } else {
+            "🌸 digital harmony achieved 🌸".to_string()
+        };
+
         let completion = Paragraph::new(Text::from(vec![
             Line::from(""),
             Line::from(Span::styled(
-                "🌸 digital harmony achieved 🌸",
+                completion_title,
                 Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -530,6 +577,11 @@ impl ZenGarden {
             .alignment(Alignment::Center);
         f.render_widget(garden, chunks[1]);
 
+        // show issues summary if there were any
+        if has_issues {
+            self.render_completion_summary(f, chunks[2]);
+        }
+
         // exit instructions
         let exit_text = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
@@ -538,7 +590,41 @@ impl ZenGarden {
             )),
         ]))
         .alignment(Alignment::Center);
-        f.render_widget(exit_text, chunks[2]);
+        f.render_widget(exit_text, chunks[3]);
+    }
+
+    fn render_completion_summary(&self, f: &mut Frame, area: Rect) {
+        let summary_block = Block::default()
+            .title("🌊 mindful observations")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let summary_area = summary_block.inner(area);
+        f.render_widget(summary_block, area);
+
+        let mut summary_lines = Vec::new();
+
+        if self.error_collector.has_errors() {
+            summary_lines.push(format!("⚡ {} turbulent moments encountered", self.error_collector.error_count()));
+        }
+
+        if self.error_collector.has_warnings() {
+            summary_lines.push(format!("🌤️ {} gentle warnings observed", self.error_collector.warning_count()));
+        }
+
+        let summary_items: Vec<ListItem> = summary_lines.iter()
+            .map(|line| {
+                let style = if line.contains("turbulent") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                ListItem::new(format!("• {}", line)).style(style)
+            })
+            .collect();
+
+        let summary_list = List::new(summary_items);
+        f.render_widget(summary_list, summary_area);
     }
 
     fn render_turbulence(&self, f: &mut Frame, area: Rect) {
@@ -546,16 +632,23 @@ impl ZenGarden {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Min(5),
+                Constraint::Min(8),
+                Constraint::Length(6),
                 Constraint::Length(3),
             ])
             .split(area);
 
-        // error message
+        // error header
+        let error_summary = if self.error_collector.has_errors() {
+            format!("🌪️ {} errors disrupted the meditation 🌪️", self.error_collector.error_count())
+        } else {
+            "🌪️ turbulence in the digital realm 🌪️".to_string()
+        };
+
         let error_msg = Paragraph::new(Text::from(vec![
             Line::from(""),
             Line::from(Span::styled(
-                "🌪️ turbulence in the digital realm 🌪️",
+                error_summary,
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -563,23 +656,11 @@ impl ZenGarden {
         .alignment(Alignment::Center);
         f.render_widget(error_msg, chunks[0]);
 
-        // turbulence description
-        let turbulence_text = vec![
-            Line::from(""),
-            Line::from("                    ⚡ unexpected energy patterns"),
-            Line::from("                  have disrupted the meditation"),
-            Line::from(""),
-            Line::from("            🌊 breathe deeply, center yourself 🌊"),
-            Line::from(""),
-            Line::from("                    🔄 the garden will restore"),
-            Line::from("                  balance when conditions align"),
-            Line::from(""),
-        ];
+        // detailed error list
+        self.render_error_details(f, chunks[1]);
 
-        let turbulence = Paragraph::new(turbulence_text)
-            .style(Style::default().fg(Color::Red))
-            .alignment(Alignment::Center);
-        f.render_widget(turbulence, chunks[1]);
+        // event log
+        self.render_error_log(f, chunks[2]);
 
         // recovery instructions
         let recovery = Paragraph::new(Text::from(vec![
@@ -589,7 +670,69 @@ impl ZenGarden {
             )),
         ]))
         .alignment(Alignment::Center);
-        f.render_widget(recovery, chunks[2]);
+        f.render_widget(recovery, chunks[3]);
+    }
+
+    fn render_error_details(&self, f: &mut Frame, area: Rect) {
+        let error_block = Block::default()
+            .title("🔥 turbulence sources")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red));
+
+        let error_area = error_block.inner(area);
+        f.render_widget(error_block, area);
+
+        if self.detailed_errors.is_empty() {
+            let no_details = Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from("                    ⚡ unexpected energy patterns"),
+                Line::from("                  have disrupted the meditation"),
+                Line::from(""),
+                Line::from("            🌊 breathe deeply, center yourself 🌊"),
+            ]))
+            .style(Style::default().fg(Color::Red))
+            .alignment(Alignment::Center);
+            f.render_widget(no_details, error_area);
+        } else {
+            let error_items: Vec<ListItem> = self.detailed_errors.iter()
+                .take(6) // limit to prevent overflow
+                .map(|error| {
+                    ListItem::new(format!("• {}", error))
+                        .style(Style::default().fg(Color::Red))
+                })
+                .collect();
+
+            let error_list = List::new(error_items);
+            f.render_widget(error_list, error_area);
+        }
+    }
+
+    fn render_error_log(&self, f: &mut Frame, area: Rect) {
+        let log_block = Block::default()
+            .title("📜 meditation journal")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let log_area = log_block.inner(area);
+        f.render_widget(log_block, area);
+
+        let log_items: Vec<ListItem> = self.events.iter()
+            .rev()
+            .take(4)
+            .map(|event| {
+                let style = if event.contains("error") || event.contains("turbulence") {
+                    Style::default().fg(Color::Red)
+                } else if event.contains("warning") {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(format!("• {}", event)).style(style)
+            })
+            .collect();
+
+        let log_list = List::new(log_items);
+        f.render_widget(log_list, log_area);
     }
 }
 
@@ -646,30 +789,59 @@ async fn zen_operations(tx: mpsc::UnboundedSender<ZenEvent>, args: CliArgs) {
     // processing phase - processes are now terminated interactively via meditation stones
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // update storage and clean databases
+    // update storage and clean databases - continue even if some operations fail
+    let mut overall_error_collector = crate::utils::ErrorCollector::new();
+
     for directory in directories {
         let display_name = directory.file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
 
-        // update storage
-        if let Err(e) = update_vscode_storage(&directory, &tx) {
-            let _ = tx.send(ZenEvent::Error(format!("Storage update failed: {}", e)));
-            return;
+        // update storage - continue even if this fails
+        match update_vscode_storage(&directory, &tx) {
+            Ok(_) => {
+                let _ = tx.send(ZenEvent::StorageUpdated(display_name.clone()));
+            }
+            Err(e) => {
+                let error = crate::utils::CleanerError::FileSystem {
+                    operation: "storage update".to_string(),
+                    path: directory.display().to_string(),
+                    source: e.to_string(),
+                };
+                overall_error_collector.add_error(error.clone());
+                let _ = tx.send(ZenEvent::DetailedError(error));
+                // still mark as "updated" to continue progress tracking
+                let _ = tx.send(ZenEvent::StorageUpdated(format!("{} (with errors)", display_name.clone())));
+            }
         }
-        let _ = tx.send(ZenEvent::StorageUpdated(display_name.clone()));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // clean database
+        // clean database - continue even if this fails
         if !args.no_signout {
-            if let Err(e) = clean_vscode_databases(&directory, &tx) {
-                let _ = tx.send(ZenEvent::Error(format!("Database cleaning failed: {}", e)));
-                return;
+            match clean_vscode_databases(&directory, &tx) {
+                Ok(_) => {
+                    let _ = tx.send(ZenEvent::DatabaseCleaned(display_name));
+                }
+                Err(e) => {
+                    let error = crate::utils::CleanerError::Database {
+                        operation: "database cleaning".to_string(),
+                        path: directory.display().to_string(),
+                        source: e.to_string(),
+                    };
+                    overall_error_collector.add_error(error.clone());
+                    let _ = tx.send(ZenEvent::DetailedError(error));
+                    // still mark as "cleaned" to continue progress tracking
+                    let _ = tx.send(ZenEvent::DatabaseCleaned(format!("{} (with errors)", display_name)));
+                }
             }
-            let _ = tx.send(ZenEvent::DatabaseCleaned(display_name));
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    // send final error summary if there were any errors
+    if overall_error_collector.has_errors() {
+        let _ = tx.send(ZenEvent::ErrorSummary(overall_error_collector));
     }
 
     // completion

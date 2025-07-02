@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use uuid::Uuid;
-use crate::utils::{Result, TELEMETRY_KEYS};
+use crate::utils::{Result, CleanerError, ErrorCollector, TELEMETRY_KEYS};
 use tokio::sync::mpsc;
 use crate::zen_garden::ZenEvent;
 
@@ -48,10 +48,36 @@ impl FilePermissions {
 }
 
 pub fn update_vscode_storage(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -> Result<()> {
-    update_storage_json(directory, tx)?;
+    let mut error_collector = ErrorCollector::new();
 
+    // try to update storage.json
+    if let Err(e) = update_storage_json(directory, tx) {
+        let error = CleanerError::FileSystem {
+            operation: "updating storage.json".to_string(),
+            path: directory.join("storage.json").display().to_string(),
+            source: e.to_string(),
+        };
+        error_collector.add_error(error.clone());
+        let _ = tx.send(ZenEvent::DetailedError(error));
+    }
+
+    // try to update machine id file if it's a file
     if directory.is_file() {
-        update_machine_id_file(directory, tx)?;
+        if let Err(e) = update_machine_id_file(directory, tx) {
+            let error = CleanerError::FileSystem {
+                operation: "updating machine id file".to_string(),
+                path: directory.display().to_string(),
+                source: e.to_string(),
+            };
+            error_collector.add_error(error.clone());
+            let _ = tx.send(ZenEvent::DetailedError(error));
+        }
+    }
+
+    // send error summary if there were any errors
+    if error_collector.has_errors() {
+        let _ = tx.send(ZenEvent::ErrorSummary(error_collector));
+        return Err("storage update encountered errors".into());
     }
 
     Ok(())
@@ -59,17 +85,39 @@ pub fn update_vscode_storage(directory: &Path, tx: &mpsc::UnboundedSender<ZenEve
 
 fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -> Result<()> {
     let storage_path = directory.join("storage.json");
-    if !storage_path.exists() { return Ok(()); }
+    if !storage_path.exists() {
+        let _ = tx.send(ZenEvent::LogMessage(format!("storage.json not found in {} - already pure", directory.display())));
+        return Ok(());
+    }
 
     let _ = tx.send(ZenEvent::LogMessage(format!("harmonizing energy patterns in: {}", storage_path.display())));
 
     // Handle Windows read-only files
     #[cfg(windows)]
-    let _permissions = FilePermissions::backup_and_make_writable(&storage_path)?;
+    let _permissions = match FilePermissions::backup_and_make_writable(&storage_path) {
+        Ok(perms) => Some(perms),
+        Err(e) => {
+            let _ = tx.send(ZenEvent::Warning(format!("could not modify permissions for storage.json: {}", e)));
+            None
+        }
+    };
 
-    let content = fs::read_to_string(&storage_path).unwrap_or_default();
-    let mut data: Map<String, Value> = serde_json::from_str(&content).unwrap_or_default();
+    let content = match fs::read_to_string(&storage_path) {
+        Ok(content) => content,
+        Err(e) => {
+            return Err(format!("failed to read storage.json: {}", e).into());
+        }
+    };
 
+    let mut data: Map<String, Value> = match serde_json::from_str(&content) {
+        Ok(data) => data,
+        Err(e) => {
+            let _ = tx.send(ZenEvent::Warning(format!("storage.json contains invalid json, creating new structure: {}", e)));
+            Map::new()
+        }
+    };
+
+    let mut updated_keys = 0;
     for &key in &TELEMETRY_KEYS {
         if let Some(old_value) = data.get(key) {
             let _ = tx.send(ZenEvent::LogMessage(format!("releasing old {}: {}", key, old_value.as_str().unwrap_or_default())));
@@ -82,16 +130,29 @@ fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -
         };
         let _ = tx.send(ZenEvent::LogMessage(format!("manifesting new {}: {}", key, new_value)));
         data.insert(key.to_string(), Value::String(new_value));
+        updated_keys += 1;
     }
 
-    let json_content = serde_json::to_string_pretty(&data)?;
-    fs::write(&storage_path, json_content)?;
+    let json_content = match serde_json::to_string_pretty(&data) {
+        Ok(content) => content,
+        Err(e) => {
+            return Err(format!("failed to serialize updated storage.json: {}", e).into());
+        }
+    };
+
+    if let Err(e) = fs::write(&storage_path, json_content) {
+        return Err(format!("failed to write updated storage.json: {}", e).into());
+    }
 
     // Restore Windows permissions
     #[cfg(windows)]
-    _permissions.restore(&storage_path)?;
+    if let Some(permissions) = _permissions {
+        if let Err(e) = permissions.restore(&storage_path) {
+            let _ = tx.send(ZenEvent::Warning(format!("could not restore permissions for storage.json: {}", e)));
+        }
+    }
 
-    let _ = tx.send(ZenEvent::LogMessage("energy patterns successfully harmonized in storage".to_string()));
+    let _ = tx.send(ZenEvent::LogMessage(format!("energy patterns successfully harmonized in storage ({} keys updated)", updated_keys)));
     Ok(())
 }
 
