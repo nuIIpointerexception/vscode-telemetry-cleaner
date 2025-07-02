@@ -24,14 +24,13 @@ use crate::{
     cli::CliArgs,
     database::clean_vscode_databases,
     filesystem::find_vscode_storage_directories,
-    process::terminate_vscode_processes,
     storage::update_vscode_storage,
 };
 
 #[derive(Debug, Clone)]
 pub enum ZenEvent {
     StartScanning,
-    ProcessFound(String),
+    ProcessFound(ProcessStone),
     LocationFound(String),
     ProcessTerminated(String),
     StorageUpdated(String),
@@ -39,6 +38,22 @@ pub enum ZenEvent {
     OperationComplete,
     Error(String),
     LogMessage(String),
+    SetTotalOperations(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessStone {
+    pub name: String,
+    pub pid: u32,
+    pub path: String,
+    pub is_selected: bool,
+    pub is_terminated: bool,
+}
+
+impl std::fmt::Display for ProcessStone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.pid)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,14 +68,17 @@ pub enum ZenState {
 pub struct ZenGarden {
     state: ZenState,
     events: Vec<String>,
-    processes: Vec<String>,
+    processes: Vec<ProcessStone>,
     locations: Vec<String>,
     progress: f64,
+    total_operations: usize,
+    completed_operations: usize,
     current_operation: String,
     start_time: Instant,
     breathing_phase: f64,
     water_flow: usize,
     should_quit: bool,
+    selected_stone: usize,
 }
 
 impl ZenGarden {
@@ -71,11 +89,14 @@ impl ZenGarden {
             processes: Vec::new(),
             locations: Vec::new(),
             progress: 0.0,
+            total_operations: 0,
+            completed_operations: 0,
             current_operation: "preparing meditation space...".to_string(),
             start_time: Instant::now(),
             breathing_phase: 0.0,
             water_flow: 0,
             should_quit: false,
+            selected_stone: 0,
         }
     }
 
@@ -96,7 +117,7 @@ impl ZenGarden {
         });
 
         let mut last_tick = Instant::now();
-        let tick_rate = Duration::from_millis(50);
+        let tick_rate = Duration::from_millis(16); // ~60fps for smooth progress updates
 
         loop {
             terminal.draw(|f| self.ui(f))?;
@@ -114,6 +135,27 @@ impl ZenGarden {
                                 if self.state == ZenState::Welcome {
                                     self.state = ZenState::Scanning;
                                     let _ = tx.send(ZenEvent::StartScanning);
+                                } else if self.state == ZenState::Scanning || self.state == ZenState::Processing {
+                                    // terminate selected process
+                                    if let Some(stone) = self.processes.get_mut(self.selected_stone) {
+                                        if !stone.is_terminated {
+                                            let pid = stone.pid;
+                                            let name = stone.name.clone();
+                                            stone.is_terminated = true;
+                                            let _ = tx.send(ZenEvent::ProcessTerminated(name));
+                                            self.terminate_process(pid);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Up => {
+                                if !self.processes.is_empty() && self.selected_stone > 0 {
+                                    self.selected_stone -= 1;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if !self.processes.is_empty() && self.selected_stone < self.processes.len() - 1 {
+                                    self.selected_stone += 1;
                                 }
                             }
                             _ => {}
@@ -164,15 +206,18 @@ impl ZenGarden {
             }
             ZenEvent::ProcessTerminated(process) => {
                 self.events.push(format!("gently guided {} to peaceful rest", process));
-                self.progress += 0.2;
+                self.completed_operations += 1;
+                self.update_progress();
             }
             ZenEvent::StorageUpdated(location) => {
                 self.events.push(format!("cleansed energy patterns in {}", location));
-                self.progress += 0.3;
+                self.completed_operations += 1;
+                self.update_progress();
             }
             ZenEvent::DatabaseCleaned(location) => {
                 self.events.push(format!("purified data streams in {}", location));
-                self.progress += 0.3;
+                self.completed_operations += 1;
+                self.update_progress();
             }
             ZenEvent::OperationComplete => {
                 self.state = ZenState::Complete;
@@ -186,6 +231,17 @@ impl ZenGarden {
             ZenEvent::LogMessage(message) => {
                 self.events.push(message);
             }
+            ZenEvent::SetTotalOperations(total) => {
+                self.total_operations = total;
+                self.completed_operations = 0;
+                self.progress = 0.0;
+            }
+        }
+    }
+
+    fn update_progress(&mut self) {
+        if self.total_operations > 0 {
+            self.progress = self.completed_operations as f64 / self.total_operations as f64;
         }
     }
 
@@ -193,6 +249,11 @@ impl ZenGarden {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         self.breathing_phase = (elapsed * 0.5).sin() * 0.5 + 0.5;
         self.water_flow = (elapsed * 2.0) as usize % 20;
+    }
+
+    fn terminate_process(&self, pid: u32) {
+        use kill_tree::blocking::kill_tree;
+        let _ = kill_tree(pid);
     }
 
     fn ui(&self, f: &mut Frame) {
@@ -243,8 +304,9 @@ impl ZenGarden {
         // meditation space
         let meditation_text = vec![
             Line::from(""),
-            Line::from("                    🪨 meditation stones"),
-            Line::from("                  ○ ○ ○   ○ ○ ○   ○ ○ ○"),
+            Line::from("                    🪨 interactive meditation stones"),
+            Line::from("                  ○ select processes to close peacefully"),
+            Line::from("                  ◉ navigate with ↑↓, close with enter"),
             Line::from(""),
             Line::from("            🌊 flowing water cleanses all attachments 🌊"),
             Line::from(""),
@@ -264,7 +326,7 @@ impl ZenGarden {
         // instructions
         let instructions = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
-                "press [enter] to begin your mindful journey • [q] to return to the world",
+                "press [enter] to scan for processes • [↑↓] to select stones • [enter] to close • [q] to exit",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
             )),
         ]))
@@ -310,7 +372,7 @@ impl ZenGarden {
 
     fn render_meditation_stones(&self, f: &mut Frame, area: Rect) {
         let stones_block = Block::default()
-            .title("🪨 meditation stones")
+            .title("🪨 meditation stones (↑↓ to select, enter to close)")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green));
 
@@ -318,7 +380,27 @@ impl ZenGarden {
         f.render_widget(stones_block, area);
 
         let stone_items: Vec<ListItem> = self.processes.iter()
-            .map(|p| ListItem::new(format!("○ {}", p)))
+            .enumerate()
+            .map(|(i, stone)| {
+                let symbol = if stone.is_terminated {
+                    "●" // solid stone - terminated
+                } else if i == self.selected_stone {
+                    "◉" // selected stone
+                } else {
+                    "○" // empty stone - active
+                };
+
+                let style = if stone.is_terminated {
+                    Style::default().fg(Color::DarkGray)
+                } else if i == self.selected_stone {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                ListItem::new(format!("{} {}", symbol, stone.name))
+                    .style(style)
+            })
             .collect();
 
         let stones_list = List::new(stone_items)
@@ -512,49 +594,57 @@ impl ZenGarden {
 }
 
 async fn zen_operations(tx: mpsc::UnboundedSender<ZenEvent>, args: CliArgs) {
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // scanning phase
     let _ = tx.send(ZenEvent::StartScanning);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // find storage locations first to calculate total operations
+    let directories = find_vscode_storage_directories();
+
+    // calculate total operations for accurate progress
+    let mut total_ops = 0;
+    for _dir in &directories {
+        total_ops += 1; // storage update
+        if !args.no_signout {
+            total_ops += 1; // database cleaning
+        }
+    }
+    let _ = tx.send(ZenEvent::SetTotalOperations(total_ops));
 
     // find processes
     if !args.no_terminate {
-        let processes = ["VSCode.exe", "Cursor.exe", "Code.exe"];
-        for process in processes {
-            let _ = tx.send(ZenEvent::ProcessFound(process.to_string()));
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        let discovered_processes = discover_vscode_processes();
+        if discovered_processes.is_empty() {
+            let _ = tx.send(ZenEvent::LogMessage("no restless processes found - digital spirits already at peace".to_string()));
+        } else {
+            for process_stone in discovered_processes {
+                let _ = tx.send(ZenEvent::ProcessFound(process_stone));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
     }
 
     // find storage locations
-    let directories = find_vscode_storage_directories();
     for dir in &directories {
         let display_name = dir.file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
         let _ = tx.send(ZenEvent::LocationFound(display_name));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     if directories.is_empty() {
-        let _ = tx.send(ZenEvent::Error("No VSCode installations found".to_string()));
+        let _ = tx.send(ZenEvent::LogMessage("no vscode installations found - digital space already pure".to_string()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(ZenEvent::OperationComplete);
         return;
     }
 
-    // processing phase
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // terminate processes
-    if !args.no_terminate {
-        let _ = terminate_vscode_processes(&tx);
-        let processes = ["VSCode.exe", "Cursor.exe", "Code.exe"];
-        for process in processes {
-            let _ = tx.send(ZenEvent::ProcessTerminated(process.to_string()));
-            tokio::time::sleep(Duration::from_millis(400)).await;
-        }
-    }
+    // processing phase - processes are now terminated interactively via meditation stones
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // update storage and clean databases
     for directory in directories {
@@ -569,7 +659,7 @@ async fn zen_operations(tx: mpsc::UnboundedSender<ZenEvent>, args: CliArgs) {
             return;
         }
         let _ = tx.send(ZenEvent::StorageUpdated(display_name.clone()));
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // clean database
         if !args.no_signout {
@@ -578,11 +668,45 @@ async fn zen_operations(tx: mpsc::UnboundedSender<ZenEvent>, args: CliArgs) {
                 return;
             }
             let _ = tx.send(ZenEvent::DatabaseCleaned(display_name));
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
     // completion
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = tx.send(ZenEvent::OperationComplete);
+}
+
+fn discover_vscode_processes() -> Vec<ProcessStone> {
+    use sysinfo::System;
+    use crate::utils::VSCODE_PROCESSES;
+
+    let mut stones = Vec::new();
+
+    for (pid, process) in System::new_all().processes() {
+        let cmd = process.cmd().join(" ".as_ref()).to_string_lossy().to_string();
+        let name = process.name().to_string_lossy().to_string();
+        let exe = process.exe().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
+
+        let is_vscode = VSCODE_PROCESSES.iter().any(|&vs| name.eq_ignore_ascii_case(vs))
+            || cmd.contains("vscode")
+            || exe.contains("microsoft vs code")
+            || exe.contains("cursor")
+            || exe.contains("code-insiders")
+            || exe.contains("windsurf")
+            || exe.contains("trae")
+            || (exe.contains("code") && exe.contains("electron"));
+
+        if is_vscode {
+            stones.push(ProcessStone {
+                name: name.clone(),
+                pid: pid.as_u32(),
+                path: exe,
+                is_selected: false,
+                is_terminated: false,
+            });
+        }
+    }
+
+    stones
 }

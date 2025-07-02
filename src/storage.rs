@@ -8,6 +8,45 @@ use crate::utils::{Result, TELEMETRY_KEYS};
 use tokio::sync::mpsc;
 use crate::zen_garden::ZenEvent;
 
+// Windows file permission handling
+#[cfg(windows)]
+struct FilePermissions {
+    was_readonly: bool,
+}
+
+#[cfg(windows)]
+impl FilePermissions {
+    fn backup_and_make_writable(file_path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(file_path)?;
+        let was_readonly = metadata.permissions().readonly();
+
+        if was_readonly {
+            // Remove read-only attribute
+            let _ = Command::new("attrib").args(["-R", &file_path.to_string_lossy()]).status();
+
+            // Also update permissions
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(file_path, permissions)?;
+        }
+
+        Ok(FilePermissions { was_readonly })
+    }
+
+    fn restore(&self, file_path: &Path) -> Result<()> {
+        if self.was_readonly {
+            // Restore read-only attribute
+            let _ = Command::new("attrib").args(["+R", &file_path.to_string_lossy()]).status();
+
+            // Also update permissions
+            let mut permissions = fs::metadata(file_path)?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(file_path, permissions)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn update_vscode_storage(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -> Result<()> {
     update_storage_json(directory, tx)?;
 
@@ -23,6 +62,10 @@ fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -
     if !storage_path.exists() { return Ok(()); }
 
     let _ = tx.send(ZenEvent::LogMessage(format!("harmonizing energy patterns in: {}", storage_path.display())));
+
+    // Handle Windows read-only files
+    #[cfg(windows)]
+    let _permissions = FilePermissions::backup_and_make_writable(&storage_path)?;
 
     let content = fs::read_to_string(&storage_path).unwrap_or_default();
     let mut data: Map<String, Value> = serde_json::from_str(&content).unwrap_or_default();
@@ -44,6 +87,10 @@ fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -
     let json_content = serde_json::to_string_pretty(&data)?;
     fs::write(&storage_path, json_content)?;
 
+    // Restore Windows permissions
+    #[cfg(windows)]
+    _permissions.restore(&storage_path)?;
+
     let _ = tx.send(ZenEvent::LogMessage("energy patterns successfully harmonized in storage".to_string()));
     Ok(())
 }
@@ -51,19 +98,24 @@ fn update_storage_json(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -
 fn update_machine_id_file(file_path: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -> Result<()> {
     let _ = tx.send(ZenEvent::LogMessage(format!("harmonizing essence in: {}", file_path.display())));
 
+    // Handle Windows read-only files
+    #[cfg(windows)]
+    let _permissions = if file_path.exists() {
+        Some(FilePermissions::backup_and_make_writable(file_path)?)
+    } else {
+        None
+    };
+
     if file_path.exists() {
         let old_uuid = fs::read_to_string(file_path).unwrap_or_default();
         if !old_uuid.is_empty() {
             let _ = tx.send(ZenEvent::LogMessage(format!("releasing old essence: {}", old_uuid.trim())));
         }
+        let _ = fs::remove_file(file_path);
     }
 
     let new_uuid = Uuid::new_v4().to_string();
     let _ = tx.send(ZenEvent::LogMessage(format!("manifesting new essence: {}", new_uuid)));
-
-    if file_path.exists() {
-        let _ = fs::remove_file(file_path);
-    }
 
     fs::write(file_path, &new_uuid)?;
     lock_file_permissions(file_path)?;

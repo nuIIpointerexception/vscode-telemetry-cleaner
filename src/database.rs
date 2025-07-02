@@ -1,8 +1,49 @@
 use rusqlite::Connection;
 use std::path::Path;
+use std::fs;
+use std::process::Command;
 use crate::utils::{Result, COUNT_QUERY, DELETE_QUERY};
 use tokio::sync::mpsc;
 use crate::zen_garden::ZenEvent;
+
+// Windows file permission handling for database files
+#[cfg(windows)]
+struct DatabasePermissions {
+    was_readonly: bool,
+}
+
+#[cfg(windows)]
+impl DatabasePermissions {
+    fn backup_and_make_writable(file_path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(file_path)?;
+        let was_readonly = metadata.permissions().readonly();
+
+        if was_readonly {
+            // Remove read-only attribute
+            let _ = Command::new("attrib").args(["-R", &file_path.to_string_lossy()]).status();
+
+            // Also update permissions
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(file_path, permissions)?;
+        }
+
+        Ok(DatabasePermissions { was_readonly })
+    }
+
+    fn restore(&self, file_path: &Path) -> Result<()> {
+        if self.was_readonly {
+            // Restore read-only attribute
+            let _ = Command::new("attrib").args(["+R", &file_path.to_string_lossy()]).status();
+
+            // Also update permissions
+            let mut permissions = fs::metadata(file_path)?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(file_path, permissions)?;
+        }
+        Ok(())
+    }
+}
 
 pub fn clean_vscode_databases(directory: &Path, tx: &mpsc::UnboundedSender<ZenEvent>) -> Result<()> {
     clean_database_file(directory, "state.vscdb", tx)?;
