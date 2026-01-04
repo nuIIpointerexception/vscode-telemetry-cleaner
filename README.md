@@ -1,5 +1,7 @@
 # VSCode Telemetry Cleaner
 
+(ai generated slop, works for what its supposed to be)
+
 Cleans VSCode privacy stuff.
 
 ## What it does
